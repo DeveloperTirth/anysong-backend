@@ -1,0 +1,18 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary downloads directory
+downloads_temp/
+
+# Exclude separate frontend repository directory
+frontend/
+
+# Environments / IDEs
+.idea/
+.vscode/
+.DS_Store
