@@ -30,11 +30,77 @@ class MyLogger:
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads_temp")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
+# List of highly reliable public Invidious instances to fall back on when YouTube blocks cloud IPs
+INVIDIOUS_INSTANCES = [
+    "https://invidious.yewtu.be",
+    "https://inv.tux.im",
+    "https://invidious.nerdvpn.de",
+    "https://vid.priv.au",
+    "https://invidious.no-logs.com",
+    "https://invidious.slipfox.xyz",
+]
+
 def clean_filename(title: str) -> str:
     """Sanitizes the track title to make it a safe filename for headers."""
-    # Keep alphanumeric characters, spaces, dashes, and underscores
     clean = re.sub(r'[^a-zA-Z0-9 \-_().]', '', title)
     return clean.strip() or "song"
+
+def get_invidious_audio_stream(video_id: str):
+    """
+    Attempts to fetch the audio stream URL and format details for a video ID 
+    by cycling through public Invidious instances.
+    """
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            # Short timeout to quickly skip down instances
+            r = requests.get(api_url, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                adaptive_formats = data.get("adaptiveFormats", [])
+                
+                # Filter for audio formats (type starts with audio/)
+                audio_formats = [
+                    f for f in adaptive_formats 
+                    if f.get("mimeType", "").startswith("audio/") or f.get("type", "").startswith("audio/")
+                ]
+                
+                if audio_formats:
+                    # Sort formats (prefer mp4/m4a, then webm; higher audio quality first)
+                    # itag 140 is typical high-quality AAC (audio/mp4)
+                    audio_formats.sort(key=lambda x: (
+                        1 if "audio/mp4" in x.get("mimeType", "") or "audio/mp4" in x.get("type", "") else 0,
+                        int(x.get("bitrate", 0))
+                    ), reverse=True)
+                    
+                    best_audio = audio_formats[0]
+                    stream_url = best_audio.get("url")
+                    
+                    if stream_url:
+                        # Convert relative URLs to absolute
+                        if stream_url.startswith("/"):
+                            stream_url = f"{instance}{stream_url}"
+                            
+                        # Extract extension
+                        mime = best_audio.get("mimeType", best_audio.get("type", ""))
+                        ext = "m4a"
+                        if "webm" in mime:
+                            ext = "webm"
+                        elif "ogg" in mime:
+                            ext = "ogg"
+                            
+                        title = data.get("title", "song")
+                        
+                        return {
+                            "url": stream_url,
+                            "ext": ext,
+                            "title": title
+                        }
+        except Exception as e:
+            print(f"Invidious instance {instance} failed: {e}")
+            continue
+            
+    return None
 
 @app.get("/api/search")
 def search_songs(q: str = Query(..., min_length=1)):
@@ -49,7 +115,6 @@ def search_songs(q: str = Query(..., min_length=1)):
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            # Limit search to 10 results for quick load
             search_query = f"ytsearch10:{q}"
             info = ydl.extract_info(search_query, download=False)
             
@@ -64,7 +129,6 @@ def search_songs(q: str = Query(..., min_length=1)):
                         continue
                         
                     duration = entry.get('duration')
-                    # Format duration to MM:SS
                     duration_str = ""
                     if duration:
                         minutes = int(duration // 60)
@@ -89,51 +153,70 @@ def search_songs(q: str = Query(..., min_length=1)):
 
 @app.get("/api/stream")
 def stream_song(id: str = Query(..., min_length=1)):
-    """Proxies the audio stream from YouTube to the client browser."""
+    """Proxies the audio stream from YouTube/Invidious to the client browser."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
         'logger': MyLogger(),
     }
     
+    # Try resolving stream url using standard yt-dlp first
+    stream_url = None
+    mime_type = None
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
             stream_url = info.get('url')
-            if not stream_url:
-                raise HTTPException(status_code=404, detail="Audio stream not found")
+            mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
+        except Exception as yt_err:
+            print(f"Direct yt-dlp stream extraction failed: {yt_err}. Falling back to Invidious...")
             
-            # Request the stream URL
-            # Stream in chunks to the client to save server memory and proxy robustly
-            r = requests.get(stream_url, stream=True, timeout=15)
+    # Fallback to Invidious if yt-dlp failed (bot challenge / 403)
+    if not stream_url:
+        invidious_data = get_invidious_audio_stream(id)
+        if invidious_data:
+            stream_url = invidious_data["url"]
+            ext = invidious_data["ext"]
+            mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
+            print("Successfully resolved stream URL via Invidious")
             
-            # Forward relevant headers
-            response_headers = {}
-            headers_to_forward = ['Content-Type', 'Content-Length', 'Accept-Ranges']
-            for h in headers_to_forward:
-                if h in r.headers:
-                    response_headers[h] = r.headers[h]
-                    
-            if 'Content-Type' not in response_headers:
-                # Fallback to audio/mp4 for m4a or webm if not present
-                response_headers['Content-Type'] = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
+    if not stream_url:
+        raise HTTPException(
+            status_code=404, 
+            detail="Audio stream not found. YouTube bot block active and all Invidious fallbacks exhausted."
+        )
+        
+    try:
+        # Request the stream URL
+        r = requests.get(stream_url, stream=True, timeout=15)
+        
+        response_headers = {}
+        headers_to_forward = ['Content-Type', 'Content-Length', 'Accept-Ranges']
+        for h in headers_to_forward:
+            if h in r.headers:
+                response_headers[h] = r.headers[h]
                 
-            def iter_content():
-                try:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        yield chunk
-                except Exception as stream_err:
-                    print(f"Streaming interrupted: {stream_err}")
-                finally:
-                    r.close()
-                    
-            return StreamingResponse(iter_content(), headers=response_headers)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
+        if 'Content-Type' not in response_headers and mime_type:
+            response_headers['Content-Type'] = mime_type
+            
+        def iter_content():
+            try:
+                for chunk in r.iter_content(chunk_size=65536):
+                    yield chunk
+            except Exception as stream_err:
+                print(f"Streaming proxy interrupted: {stream_err}")
+            finally:
+                r.close()
+                
+        return StreamingResponse(iter_content(), headers=response_headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
 
 @app.get("/api/download")
 def download_song(id: str = Query(..., min_length=1), background_tasks: BackgroundTasks = BackgroundTasks()):
     """Downloads the audio file onto the server, and returns it as a direct download attachment."""
+    # Attempt download using yt-dlp first
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(DOWNLOADS_DIR, '%(id)s.%(ext)s'),
@@ -141,47 +224,76 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
         'logger': MyLogger(),
     }
     
+    file_path = None
+    ext = 'm4a'
+    title = 'song'
+    download_success = False
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            # Download audio file locally
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=True)
             ext = info.get('ext', 'm4a')
             file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
-            
-            if not os.path.exists(file_path):
-                raise HTTPException(status_code=404, detail="File download failed")
-                
-            # Create a clean, human-readable file name for the user
             title = info.get('title', 'song')
-            sanitized_title = clean_filename(title)
-            filename = f"{sanitized_title}.{ext}"
-            
-            # Delete file after sending response
-            def remove_file(path: str):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception as clean_err:
-                    print(f"Error removing temp file {path}: {clean_err}")
-                    
-            background_tasks.add_task(remove_file, file_path)
-            
-            # Return file
-            return FileResponse(
-                path=file_path,
-                filename=filename,
-                media_type='application/octet-stream',
-                background=background_tasks
-            )
-        except Exception as e:
-            # Clean up file in case of error during return
-            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.m4a")
             if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-            raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+                download_success = True
+        except Exception as yt_err:
+            print(f"Direct yt-dlp download failed: {yt_err}. Falling back to Invidious...")
+            
+    # Fallback to Invidious download
+    if not download_success:
+        invidious_data = get_invidious_audio_stream(id)
+        if invidious_data:
+            stream_url = invidious_data["url"]
+            ext = invidious_data["ext"]
+            title = invidious_data["title"]
+            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+            
+            try:
+                # Stream the chunks locally using requests
+                r = requests.get(stream_url, stream=True, timeout=45)
+                if r.status_code == 200:
+                    with open(file_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    download_success = True
+                    print("Successfully downloaded file locally via Invidious")
+            except Exception as inv_err:
+                print(f"Invidious file download failed: {inv_err}")
+                
+    if not download_success or not file_path or not os.path.exists(file_path):
+        # Cleanup file path if it exists
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        raise HTTPException(
+            status_code=500, 
+            detail="Download failed. YouTube bot block active and all Invidious fallbacks exhausted."
+        )
+        
+    # Prepare clean response filename
+    sanitized_title = clean_filename(title)
+    filename = f"{sanitized_title}.{ext}"
+    
+    # Delete file after response is completed
+    def remove_file(path: str):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as clean_err:
+            print(f"Error removing temp file {path}: {clean_err}")
+            
+    background_tasks.add_task(remove_file, file_path)
+    
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type='application/octet-stream',
+        background=background_tasks
+    )
 
 if __name__ == "__main__":
     import uvicorn
