@@ -30,15 +30,49 @@ class MyLogger:
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads_temp")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# List of highly reliable public Invidious instances to fall back on when YouTube blocks cloud IPs
-INVIDIOUS_INSTANCES = [
+# Highly reliable static fallback list of Invidious instances
+STATIC_INVIDIOUS_INSTANCES = [
+    "https://invidious.nerdvpn.de",
+    "https://inv.nadeko.net",
+    "https://invidious.tiekoetter.com",
+    "https://invidious.f5.si",
+    "https://yt.chocolatemoo53.com",
     "https://invidious.yewtu.be",
     "https://inv.tux.im",
-    "https://invidious.nerdvpn.de",
     "https://vid.priv.au",
-    "https://invidious.no-logs.com",
-    "https://invidious.slipfox.xyz",
 ]
+
+def fetch_active_invidious_instances() -> list:
+    """
+    Dynamically fetches the healthiest public HTTPS Invidious instances
+    from the official Invidious API.
+    """
+    try:
+        r = requests.get("https://api.invidious.io/instances.json", timeout=6)
+        if r.status_code == 200:
+            instances_data = r.json()
+            active_list = []
+            for inst in instances_data:
+                domain = inst[0]
+                metadata = inst[1]
+                
+                # Verify it is HTTPS, not darknet/isolated, and has active monitor success
+                if (metadata.get('type') == 'https' and 
+                    not domain.endswith('.onion') and 
+                    not domain.endswith('.i2p') and 
+                    not domain.endswith('.ygg')):
+                    
+                    monitor = metadata.get('monitor')
+                    if monitor and monitor.get('statusClass') == 'success':
+                        active_list.append(f"https://{domain}")
+                        
+            if active_list:
+                print(f"Successfully fetched {len(active_list)} active Invidious instances dynamically.")
+                return active_list
+    except Exception as e:
+        print(f"Failed to fetch dynamic Invidious instances: {e}. Using static fallbacks.")
+        
+    return STATIC_INVIDIOUS_INSTANCES
 
 def clean_filename(title: str) -> str:
     """Sanitizes the track title to make it a safe filename for headers."""
@@ -48,18 +82,21 @@ def clean_filename(title: str) -> str:
 def get_invidious_audio_stream(video_id: str):
     """
     Attempts to fetch the audio stream URL and format details for a video ID 
-    by cycling through public Invidious instances.
+    by cycling through dynamic and static public Invidious instances.
     """
-    for instance in INVIDIOUS_INSTANCES:
+    instances = fetch_active_invidious_instances()
+    
+    # Try the top 10 instances to find a working stream
+    for instance in instances[:10]:
         try:
             api_url = f"{instance}/api/v1/videos/{video_id}"
-            # Short timeout to quickly skip down instances
-            r = requests.get(api_url, timeout=4)
+            # 8-second timeout to handle slow handshakes on free cloud tiers
+            r = requests.get(api_url, timeout=8)
             if r.status_code == 200:
                 data = r.json()
                 adaptive_formats = data.get("adaptiveFormats", [])
                 
-                # Filter for audio formats (type starts with audio/)
+                # Filter for audio formats
                 audio_formats = [
                     f for f in adaptive_formats 
                     if f.get("mimeType", "").startswith("audio/") or f.get("type", "").startswith("audio/")
@@ -67,7 +104,6 @@ def get_invidious_audio_stream(video_id: str):
                 
                 if audio_formats:
                     # Sort formats (prefer mp4/m4a, then webm; higher audio quality first)
-                    # itag 140 is typical high-quality AAC (audio/mp4)
                     audio_formats.sort(key=lambda x: (
                         1 if "audio/mp4" in x.get("mimeType", "") or "audio/mp4" in x.get("type", "") else 0,
                         int(x.get("bitrate", 0))
@@ -77,11 +113,9 @@ def get_invidious_audio_stream(video_id: str):
                     stream_url = best_audio.get("url")
                     
                     if stream_url:
-                        # Convert relative URLs to absolute
                         if stream_url.startswith("/"):
                             stream_url = f"{instance}{stream_url}"
                             
-                        # Extract extension
                         mime = best_audio.get("mimeType", best_audio.get("type", ""))
                         ext = "m4a"
                         if "webm" in mime:
@@ -97,7 +131,7 @@ def get_invidious_audio_stream(video_id: str):
                             "title": title
                         }
         except Exception as e:
-            print(f"Invidious instance {instance} failed: {e}")
+            print(f"Invidious instance {instance} extraction failed: {e}")
             continue
             
     return None
@@ -158,12 +192,17 @@ def stream_song(id: str = Query(..., min_length=1)):
         'format': 'bestaudio/best',
         'quiet': True,
         'logger': MyLogger(),
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android_music', 'web_embedded']
+            }
+        }
     }
     
-    # Try resolving stream url using standard yt-dlp first
     stream_url = None
     mime_type = None
     
+    # Try resolving stream url using standard yt-dlp first
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
@@ -172,7 +211,7 @@ def stream_song(id: str = Query(..., min_length=1)):
         except Exception as yt_err:
             print(f"Direct yt-dlp stream extraction failed: {yt_err}. Falling back to Invidious...")
             
-    # Fallback to Invidious if yt-dlp failed (bot challenge / 403)
+    # Fallback to Invidious if yt-dlp failed
     if not stream_url:
         invidious_data = get_invidious_audio_stream(id)
         if invidious_data:
@@ -188,7 +227,6 @@ def stream_song(id: str = Query(..., min_length=1)):
         )
         
     try:
-        # Request the stream URL
         r = requests.get(stream_url, stream=True, timeout=15)
         
         response_headers = {}
@@ -216,12 +254,16 @@ def stream_song(id: str = Query(..., min_length=1)):
 @app.get("/api/download")
 def download_song(id: str = Query(..., min_length=1), background_tasks: BackgroundTasks = BackgroundTasks()):
     """Downloads the audio file onto the server, and returns it as a direct download attachment."""
-    # Attempt download using yt-dlp first
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(DOWNLOADS_DIR, '%(id)s.%(ext)s'),
         'quiet': True,
         'logger': MyLogger(),
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android_music', 'web_embedded']
+            }
+        }
     }
     
     file_path = None
@@ -229,6 +271,7 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
     title = 'song'
     download_success = False
     
+    # Try downloading with yt-dlp first
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=True)
@@ -250,8 +293,8 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
             file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
             
             try:
-                # Stream the chunks locally using requests
-                r = requests.get(stream_url, stream=True, timeout=45)
+                # 60-second timeout for slow file downloads over the network
+                r = requests.get(stream_url, stream=True, timeout=60)
                 if r.status_code == 200:
                     with open(file_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -263,7 +306,6 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
                 print(f"Invidious file download failed: {inv_err}")
                 
     if not download_success or not file_path or not os.path.exists(file_path):
-        # Cleanup file path if it exists
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -274,11 +316,9 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
             detail="Download failed. YouTube bot block active and all Invidious fallbacks exhausted."
         )
         
-    # Prepare clean response filename
     sanitized_title = clean_filename(title)
     filename = f"{sanitized_title}.{ext}"
     
-    # Delete file after response is completed
     def remove_file(path: str):
         try:
             if os.path.exists(path):
