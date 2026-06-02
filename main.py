@@ -5,6 +5,7 @@ import yt_dlp
 import requests
 import os
 import re
+import time
 
 app = FastAPI(title="Anysong API")
 
@@ -30,7 +31,24 @@ class MyLogger:
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads_temp")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Highly reliable static fallback list of Invidious instances
+# Clean up leftover temporary files on server boot (prevents storage leaks)
+def cleanup_temp_folder():
+    try:
+        if os.path.exists(DOWNLOADS_DIR):
+            files_removed = 0
+            for file in os.listdir(DOWNLOADS_DIR):
+                file_path = os.path.join(DOWNLOADS_DIR, file)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                    files_removed += 1
+            if files_removed > 0:
+                print(f"Janitor Cleanup: Removed {files_removed} orphaned temp files on boot.")
+    except Exception as e:
+        print(f"Janitor Cleanup Error: {e}")
+
+cleanup_temp_folder()
+
+# Standard static fallback list of Invidious instances
 STATIC_INVIDIOUS_INSTANCES = [
     "https://invidious.nerdvpn.de",
     "https://inv.nadeko.net",
@@ -42,13 +60,38 @@ STATIC_INVIDIOUS_INSTANCES = [
     "https://vid.priv.au",
 ]
 
+# Simple In-Memory TTL Cache Implementation for ultimate speed and efficiency
+class TTLValue:
+    def __init__(self, value, ttl: int):
+        self.value = value
+        self.expiry = time.time() + ttl
+
+class InMemoryTTLCache:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key: str):
+        if key in self.store:
+            item = self.store[key]
+            if time.time() < item.expiry:
+                return item.value
+            else:
+                del self.store[key]
+        return None
+
+    def set(self, key: str, value, ttl: int = 1800):
+        self.store[key] = TTLValue(value, ttl)
+
+# Instantiate caches
+# Search Cache: 30 minutes TTL
+search_cache = InMemoryTTLCache()
+# Stream URL Cache: 1 hour TTL
+stream_cache = InMemoryTTLCache()
+
 def fetch_active_invidious_instances() -> list:
-    """
-    Dynamically fetches the healthiest public HTTPS Invidious instances
-    from the official Invidious API.
-    """
+    """Dynamically retrieves active public Invidious instances to ensure maximum uptime."""
     try:
-        r = requests.get("https://api.invidious.io/instances.json", timeout=6)
+        r = requests.get("https://api.invidious.io/instances.json", timeout=5)
         if r.status_code == 200:
             instances_data = r.json()
             active_list = []
@@ -56,7 +99,7 @@ def fetch_active_invidious_instances() -> list:
                 domain = inst[0]
                 metadata = inst[1]
                 
-                # Verify it is HTTPS, not darknet/isolated, and has active monitor success
+                # Exclude onion, i2p, yggdrasil and enforce active status monitor
                 if (metadata.get('type') == 'https' and 
                     not domain.endswith('.onion') and 
                     not domain.endswith('.i2p') and 
@@ -67,10 +110,9 @@ def fetch_active_invidious_instances() -> list:
                         active_list.append(f"https://{domain}")
                         
             if active_list:
-                print(f"Successfully fetched {len(active_list)} active Invidious instances dynamically.")
                 return active_list
     except Exception as e:
-        print(f"Failed to fetch dynamic Invidious instances: {e}. Using static fallbacks.")
+        print(f"Failed to dynamically fetch Invidious instances: {e}. Falling back to static list.")
         
     return STATIC_INVIDIOUS_INSTANCES
 
@@ -79,31 +121,62 @@ def clean_filename(title: str) -> str:
     clean = re.sub(r'[^a-zA-Z0-9 \-_().]', '', title)
     return clean.strip() or "song"
 
-def get_invidious_audio_stream(video_id: str):
-    """
-    Attempts to fetch the audio stream URL and format details for a video ID 
-    by cycling through dynamic and static public Invidious instances.
-    """
+def search_via_invidious(query: str) -> list:
+    """Failsafe search pipeline. Queries public Invidious instances if yt-dlp fails."""
     instances = fetch_active_invidious_instances()
-    
-    # Try the top 10 instances to find a working stream
+    for instance in instances[:5]:
+        try:
+            api_url = f"{instance}/api/v1/search"
+            r = requests.get(api_url, params={"q": query, "type": "video"}, timeout=6)
+            if r.status_code == 200:
+                results = []
+                for entry in r.json():
+                    video_id = entry.get('videoId')
+                    if not video_id:
+                        continue
+                        
+                    duration = entry.get('lengthSeconds', 0)
+                    duration_str = ""
+                    if duration:
+                        minutes = int(duration // 60)
+                        seconds = int(duration % 60)
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                        
+                    results.append({
+                        'id': video_id,
+                        'title': entry.get('title', 'Unknown Title'),
+                        'duration': duration_str,
+                        'duration_seconds': duration,
+                        'uploader': entry.get('author', 'Unknown Artist'),
+                        'views': f"{entry.get('viewCount', 0):,}",
+                        'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                        'url': f"https://www.youtube.com/watch?v={video_id}"
+                    })
+                return results
+        except Exception as e:
+            print(f"Invidious search fallback failed for {instance}: {e}")
+            continue
+    return []
+
+def get_invidious_audio_stream(video_id: str):
+    """Retrieves direct audio streams via healthy Invidious instances."""
+    instances = fetch_active_invidious_instances()
     for instance in instances[:10]:
         try:
             api_url = f"{instance}/api/v1/videos/{video_id}"
-            # 8-second timeout to handle slow handshakes on free cloud tiers
             r = requests.get(api_url, timeout=8)
             if r.status_code == 200:
                 data = r.json()
                 adaptive_formats = data.get("adaptiveFormats", [])
                 
-                # Filter for audio formats
                 audio_formats = [
                     f for f in adaptive_formats 
                     if f.get("mimeType", "").startswith("audio/") or f.get("type", "").startswith("audio/")
                 ]
                 
                 if audio_formats:
-                    # Sort formats (prefer mp4/m4a, then webm; higher audio quality first)
                     audio_formats.sort(key=lambda x: (
                         1 if "audio/mp4" in x.get("mimeType", "") or "audio/mp4" in x.get("type", "") else 0,
                         int(x.get("bitrate", 0))
@@ -131,14 +204,21 @@ def get_invidious_audio_stream(video_id: str):
                             "title": title
                         }
         except Exception as e:
-            print(f"Invidious instance {instance} extraction failed: {e}")
+            print(f"Invidious instance {instance} stream fetch failed: {e}")
             continue
             
     return None
 
 @app.get("/api/search")
 def search_songs(q: str = Query(..., min_length=1)):
-    """Searches YouTube for tracks using yt-dlp and returns a list of results."""
+    """Searches YouTube for tracks with built-in in-memory caching and automatic fallback."""
+    query_key = q.strip().lower()
+    
+    # Check cache first (returns in < 1ms)
+    cached_val = search_cache.get(query_key)
+    if cached_val:
+        return {"results": cached_val, "cached": True}
+        
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
@@ -147,12 +227,15 @@ def search_songs(q: str = Query(..., min_length=1)):
         'extract_flat': 'in_playlist',
     }
     
+    results = []
+    search_success = False
+    
+    # Attempt search via yt-dlp first
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             search_query = f"ytsearch10:{q}"
             info = ydl.extract_info(search_query, download=False)
             
-            results = []
             if info and 'entries' in info:
                 for entry in info['entries']:
                     if not entry:
@@ -181,44 +264,68 @@ def search_songs(q: str = Query(..., min_length=1)):
                         'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
                         'url': f"https://www.youtube.com/watch?v={video_id}"
                     })
-            return {"results": results}
+                search_success = True
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+            print(f"Direct yt-dlp search failed: {e}. Falling back to Invidious search...")
+            
+    # Trigger Invidious search fallback if yt-dlp was blocked/failed
+    if not search_success or not results:
+        results = search_via_invidious(q)
+        if results:
+            print("Search successfully completed via Invidious search fallback.")
+            
+    if not results:
+        # Avoid caching empty results
+        return {"results": []}
+        
+    # Write to cache (30 minutes TTL)
+    search_cache.set(query_key, results, ttl=1800)
+    
+    return {"results": results, "cached": False}
 
 @app.get("/api/stream")
 def stream_song(id: str = Query(..., min_length=1)):
-    """Proxies the audio stream from YouTube/Invidious to the client browser."""
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'logger': MyLogger(),
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'android_music', 'web_embedded']
+    """Proxies the audio stream from YouTube/Invidious with stream URL caching."""
+    # Check cache first
+    cached_data = stream_cache.get(id)
+    if cached_data:
+        stream_url = cached_data["url"]
+        mime_type = cached_data["mime_type"]
+    else:
+        stream_url = None
+        mime_type = None
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'logger': MyLogger(),
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'android_music', 'web_embedded']
+                }
             }
         }
-    }
-    
-    stream_url = None
-    mime_type = None
-    
-    # Try resolving stream url using standard yt-dlp first
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
-            stream_url = info.get('url')
-            mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
-        except Exception as yt_err:
-            print(f"Direct yt-dlp stream extraction failed: {yt_err}. Falling back to Invidious...")
-            
-    # Fallback to Invidious if yt-dlp failed
-    if not stream_url:
-        invidious_data = get_invidious_audio_stream(id)
-        if invidious_data:
-            stream_url = invidious_data["url"]
-            ext = invidious_data["ext"]
-            mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
-            print("Successfully resolved stream URL via Invidious")
+        
+        # Try resolving via yt-dlp
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
+                stream_url = info.get('url')
+                mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
+            except Exception as yt_err:
+                print(f"yt-dlp stream extraction failed: {yt_err}. Trying Invidious fallback...")
+                
+        # Try resolving via Invidious
+        if not stream_url:
+            invidious_data = get_invidious_audio_stream(id)
+            if invidious_data:
+                stream_url = invidious_data["url"]
+                ext = invidious_data["ext"]
+                mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
+                
+        # If resolved successfully, store in cache (1 hour TTL)
+        if stream_url and mime_type:
+            stream_cache.set(id, {"url": stream_url, "mime_type": mime_type}, ttl=3600)
             
     if not stream_url:
         raise HTTPException(
@@ -281,9 +388,9 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
             if os.path.exists(file_path):
                 download_success = True
         except Exception as yt_err:
-            print(f"Direct yt-dlp download failed: {yt_err}. Falling back to Invidious...")
+            print(f"yt-dlp download failed: {yt_err}. Trying Invidious fallback...")
             
-    # Fallback to Invidious download
+    # Try downloading with Invidious fallback
     if not download_success:
         invidious_data = get_invidious_audio_stream(id)
         if invidious_data:
@@ -293,7 +400,6 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
             file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
             
             try:
-                # 60-second timeout for slow file downloads over the network
                 r = requests.get(stream_url, stream=True, timeout=60)
                 if r.status_code == 200:
                     with open(file_path, 'wb') as f:
@@ -301,7 +407,6 @@ def download_song(id: str = Query(..., min_length=1), background_tasks: Backgrou
                             if chunk:
                                 f.write(chunk)
                     download_success = True
-                    print("Successfully downloaded file locally via Invidious")
             except Exception as inv_err:
                 print(f"Invidious file download failed: {inv_err}")
                 
