@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
 import yt_dlp
 import requests
 import os
 import re
 import time
+import base64
+from pyDes import des, ECB, PAD_PKCS5
 
 app = FastAPI(title="Anysong API")
 
@@ -47,6 +49,91 @@ def cleanup_temp_folder():
         print(f"Janitor Cleanup Error: {e}")
 
 cleanup_temp_folder()
+
+def decrypt_saavn_url(encrypted_url: str) -> str:
+    """Decrypts JioSaavn encrypted media URL using DES ECB decryption."""
+    try:
+        key = b"38346591"
+        cipher = des(key, ECB, padmode=PAD_PKCS5)
+        enc_data = base64.b64decode(encrypted_url.strip())
+        dec_data = cipher.decrypt(enc_data)
+        return dec_data.decode('utf-8')
+    except Exception as e:
+        print(f"JioSaavn decryption failed: {e}")
+        return ""
+
+def search_via_saavn(query: str) -> list:
+    """Queries JioSaavn search API, decrypts URLs, and returns formatted results."""
+    try:
+        search_url = "https://www.jiosaavn.com/api.php"
+        params = {
+            "__call": "search.getResults",
+            "_format": "json",
+            "_marker": "0",
+            "cc": "in",
+            "includeMetaTags": "1",
+            "q": query
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        r = requests.get(search_url, params=params, headers=headers, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get("results", [])
+            formatted = []
+            for entry in results:
+                song_id = entry.get("id")
+                if not song_id:
+                    continue
+                    
+                encrypted_url = entry.get("encrypted_media_url")
+                stream_url = ""
+                if encrypted_url:
+                    decrypted = decrypt_saavn_url(encrypted_url)
+                    if decrypted:
+                        has_320 = str(entry.get("320kbps")).lower() == "true"
+                        if has_320:
+                            stream_url = decrypted.replace("_96.mp4", "_320.mp4")
+                        else:
+                            stream_url = decrypted.replace("_96.mp4", "_160.mp4")
+                
+                # Fetch image and convert 150x150 to high quality 500x500
+                img = entry.get("image", "")
+                if img and "150x150" in img:
+                    img = img.replace("150x150", "500x500")
+                elif img and "50x50" in img:
+                    img = img.replace("50x50", "500x500")
+                
+                # Format duration
+                duration_seconds = int(entry.get("duration", 0))
+                duration_str = ""
+                if duration_seconds:
+                    minutes = int(duration_seconds // 60)
+                    seconds = int(duration_seconds % 60)
+                    duration_str = f"{minutes}:{seconds:02d}"
+                else:
+                    duration_str = "Unknown"
+                
+                # Uploader/Singers
+                artists = entry.get("singers") or entry.get("primary_artists") or "Unknown Artist"
+                
+                formatted.append({
+                    'id': song_id,
+                    'source': 'saavn',
+                    'title': entry.get('song', 'Unknown Title'),
+                    'duration': duration_str,
+                    'duration_seconds': duration_seconds,
+                    'uploader': artists,
+                    'views': f"{int(entry.get('play_count', 0)):,}" if entry.get('play_count') else "0",
+                    'thumbnail': img,
+                    'url': entry.get('perma_url', ''),
+                    'stream_url': stream_url
+                })
+            return formatted
+    except Exception as e:
+        print(f"JioSaavn search failed: {e}")
+    return []
 
 # Standard static fallback list of Invidious instances
 STATIC_INVIDIOUS_INSTANCES = [
@@ -106,7 +193,7 @@ def fetch_active_invidious_instances() -> list:
                     not domain.endswith('.ygg')):
                     
                     monitor = metadata.get('monitor')
-                    if monitor and monitor.get('statusClass') == 'success':
+                    if monitor and not monitor.get('down') and monitor.get('last_status') == 200:
                         active_list.append(f"https://{domain}")
                         
             if active_list:
@@ -211,7 +298,7 @@ def get_invidious_audio_stream(video_id: str):
 
 @app.get("/api/search")
 def search_songs(q: str = Query(..., min_length=1)):
-    """Searches YouTube for tracks with built-in in-memory caching and automatic fallback."""
+    """Searches JioSaavn first, and falls back to YouTube/Invidious with built-in caching."""
     query_key = q.strip().lower()
     
     # Check cache first (returns in < 1ms)
@@ -219,63 +306,72 @@ def search_songs(q: str = Query(..., min_length=1)):
     if cached_val:
         return {"results": cached_val, "cached": True}
         
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'logger': MyLogger(),
-        'extract_flat': 'in_playlist',
-    }
+    results = search_via_saavn(q)
     
-    results = []
-    search_success = False
-    
-    # Attempt search via yt-dlp first
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            search_query = f"ytsearch10:{q}"
-            info = ydl.extract_info(search_query, download=False)
-            
-            if info and 'entries' in info:
-                for entry in info['entries']:
-                    if not entry:
-                        continue
-                    
-                    video_id = entry.get('id')
-                    if not video_id:
-                        continue
-                        
-                    duration = entry.get('duration')
-                    duration_str = ""
-                    if duration:
-                        minutes = int(duration // 60)
-                        seconds = int(duration % 60)
-                        duration_str = f"{minutes}:{seconds:02d}"
-                    else:
-                        duration_str = "Unknown"
-                        
-                    results.append({
-                        'id': video_id,
-                        'title': entry.get('title', 'Unknown Title'),
-                        'duration': duration_str,
-                        'duration_seconds': duration,
-                        'uploader': entry.get('uploader') or entry.get('channel', 'Unknown Artist'),
-                        'views': f"{entry.get('view_count', 0):,}" if entry.get('view_count') else "0",
-                        'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                        'url': f"https://www.youtube.com/watch?v={video_id}"
-                    })
-                search_success = True
-        except Exception as e:
-            print(f"Direct yt-dlp search failed: {e}. Falling back to Invidious search...")
-            
-    # Trigger Invidious search fallback if yt-dlp was blocked/failed
-    if not search_success or not results:
-        results = search_via_invidious(q)
-        if results:
-            print("Search successfully completed via Invidious search fallback.")
-            
+    # Trigger YouTube fallback if JioSaavn returned no results
     if not results:
-        # Avoid caching empty results
+        print("JioSaavn search returned zero results. Falling back to YouTube...")
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'logger': MyLogger(),
+            'extract_flat': 'in_playlist',
+        }
+        
+        search_success = False
+        
+        # Attempt search via yt-dlp first
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                search_query = f"ytsearch10:{q}"
+                info = ydl.extract_info(search_query, download=False)
+                
+                if info and 'entries' in info:
+                    for entry in info['entries']:
+                        if not entry:
+                            continue
+                        
+                        video_id = entry.get('id')
+                        if not video_id:
+                            continue
+                            
+                        duration = entry.get('duration')
+                        duration_str = ""
+                        if duration:
+                            minutes = int(duration // 60)
+                            seconds = int(duration % 60)
+                            duration_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            duration_str = "Unknown"
+                            
+                        results.append({
+                            'id': video_id,
+                            'source': 'youtube',
+                            'title': entry.get('title', 'Unknown Title'),
+                            'duration': duration_str,
+                            'duration_seconds': duration,
+                            'uploader': entry.get('uploader') or entry.get('channel', 'Unknown Artist'),
+                            'views': f"{entry.get('view_count', 0):,}" if entry.get('view_count') else "0",
+                            'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                            'url': f"https://www.youtube.com/watch?v={video_id}",
+                            'stream_url': ''
+                        })
+                    search_success = True
+            except Exception as e:
+                print(f"Direct yt-dlp search failed: {e}. Trying Invidious search fallback...")
+                
+        # Trigger Invidious search fallback if yt-dlp failed
+        if not search_success or not results:
+            raw_invidious = search_via_invidious(q)
+            if raw_invidious:
+                for r in raw_invidious:
+                    r['source'] = 'youtube'
+                    r['stream_url'] = ''
+                    results.append(r)
+                print("Search successfully completed via Invidious search fallback.")
+                
+    if not results:
         return {"results": []}
         
     # Write to cache (30 minutes TTL)
@@ -284,9 +380,42 @@ def search_songs(q: str = Query(..., min_length=1)):
     return {"results": results, "cached": False}
 
 @app.get("/api/stream")
-def stream_song(id: str = Query(..., min_length=1)):
-    """Proxies the audio stream from YouTube/Invidious with stream URL caching."""
-    # Check cache first
+def stream_song(id: str = Query(..., min_length=1), source: str = Query("youtube")):
+    """Proxies the audio stream from YouTube/Invidious or redirects for JioSaavn with stream URL caching."""
+    if source == "saavn":
+        cached_data = stream_cache.get(id)
+        if cached_data:
+            stream_url = cached_data["url"]
+        else:
+            stream_url = None
+            try:
+                search_url = "https://www.jiosaavn.com/api.php"
+                params_details = {
+                    "__call": "song.getDetails",
+                    "_format": "json",
+                    "pids": id
+                }
+                r_details = requests.get(search_url, params=params_details, timeout=6)
+                if r_details.status_code == 200:
+                    details_data = r_details.json()
+                    song_details = details_data.get(id)
+                    if song_details:
+                        encrypted_url = song_details.get("encrypted_media_url")
+                        if encrypted_url:
+                            decrypted = decrypt_saavn_url(encrypted_url)
+                            if decrypted:
+                                has_320 = str(song_details.get("320kbps")).lower() == "true"
+                                stream_url = decrypted.replace("_96.mp4", "_320.mp4") if has_320 else decrypted.replace("_96.mp4", "_160.mp4")
+                                stream_cache.set(id, {"url": stream_url, "mime_type": "audio/mp4"}, ttl=3600)
+            except Exception as e:
+                print(f"JioSaavn stream details fetch failed: {e}")
+                
+        if not stream_url:
+            raise HTTPException(status_code=404, detail="JioSaavn stream URL could not be resolved.")
+            
+        return RedirectResponse(url=stream_url)
+
+    # Check cache first for YouTube
     cached_data = stream_cache.get(id)
     if cached_data:
         stream_url = cached_data["url"]
@@ -359,8 +488,81 @@ def stream_song(id: str = Query(..., min_length=1)):
         raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
 
 @app.get("/api/download")
-def download_song(id: str = Query(..., min_length=1), background_tasks: BackgroundTasks = BackgroundTasks()):
+def download_song(id: str = Query(..., min_length=1), source: str = Query("youtube"), background_tasks: BackgroundTasks = BackgroundTasks()):
     """Downloads the audio file onto the server, and returns it as a direct download attachment."""
+    if source == "saavn":
+        stream_url = None
+        title = "song"
+        ext = "mp4"
+        
+        cached_data = stream_cache.get(id)
+        if cached_data:
+            stream_url = cached_data["url"]
+            
+        try:
+            search_url = "https://www.jiosaavn.com/api.php"
+            params_details = {
+                "__call": "song.getDetails",
+                "_format": "json",
+                "pids": id
+            }
+            r_details = requests.get(search_url, params=params_details, timeout=6)
+            if r_details.status_code == 200:
+                details_data = r_details.json()
+                song_details = details_data.get(id)
+                if song_details:
+                    title = song_details.get("song", "song")
+                    encrypted_url = song_details.get("encrypted_media_url")
+                    if encrypted_url:
+                        decrypted = decrypt_saavn_url(encrypted_url)
+                        if decrypted:
+                            has_320 = str(song_details.get("320kbps")).lower() == "true"
+                            stream_url = decrypted.replace("_96.mp4", "_320.mp4") if has_320 else decrypted.replace("_96.mp4", "_160.mp4")
+        except Exception as e:
+            print(f"JioSaavn download details fetch failed: {e}")
+            
+        if not stream_url:
+            raise HTTPException(status_code=404, detail="JioSaavn download URL could not be resolved.")
+            
+        file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+        download_success = False
+        try:
+            r = requests.get(stream_url, stream=True, timeout=60)
+            if r.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                download_success = True
+        except Exception as err:
+            print(f"Saavn file download failed: {err}")
+            
+        if not download_success or not os.path.exists(file_path):
+            if os.path.exists(file_path):
+                try: os.remove(file_path)
+                except: pass
+            raise HTTPException(status_code=500, detail="JioSaavn track download from CDN failed.")
+            
+        sanitized_title = clean_filename(title)
+        filename = f"{sanitized_title}.mp3"
+        
+        def remove_file(path: str):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as clean_err:
+                print(f"Error removing temp file {path}: {clean_err}")
+                
+        background_tasks.add_task(remove_file, file_path)
+        
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type='audio/mpeg',
+            background=background_tasks
+        )
+
+    # YouTube download logic
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(DOWNLOADS_DIR, '%(id)s.%(ext)s'),
