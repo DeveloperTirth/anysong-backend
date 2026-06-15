@@ -165,7 +165,7 @@ def get_invidious_audio_stream(video_id: str):
     instances = fetch_active_invidious_instances()
     for instance in instances[:10]:
         try:
-            api_url = f"{instance}/api/v1/videos/{video_id}"
+            api_url = f"{instance}/api/v1/videos/{video_id}?local=true"
             r = requests.get(api_url, timeout=8)
             if r.status_code == 200:
                 data = r.json()
