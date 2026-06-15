@@ -3,3 +3,4 @@ uvicorn
 yt-dlp
 requests
 pyDes
+static-ffmpeg

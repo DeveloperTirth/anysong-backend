@@ -8,6 +8,15 @@ import re
 import time
 import base64
 from pyDes import des, ECB, PAD_PKCS5
+import static_ffmpeg
+
+# Initialize FFmpeg binaries dynamically on system PATH
+try:
+    print("Bootstrapping static-ffmpeg...")
+    static_ffmpeg.add_paths()
+    print("static-ffmpeg loaded successfully.")
+except Exception as static_err:
+    print(f"Error loading static-ffmpeg: {static_err}")
 
 app = FastAPI(title="Anysong API")
 
@@ -298,7 +307,7 @@ def get_invidious_audio_stream(video_id: str):
 
 @app.get("/api/search")
 def search_songs(q: str = Query(..., min_length=1)):
-    """Searches JioSaavn first, and falls back to YouTube/Invidious with built-in caching."""
+    """Searches YouTube first, falling back to Invidious, and appends JioSaavn results at the bottom."""
     query_key = q.strip().lower()
     
     # Check cache first (returns in < 1ms)
@@ -306,71 +315,76 @@ def search_songs(q: str = Query(..., min_length=1)):
     if cached_val:
         return {"results": cached_val, "cached": True}
         
-    results = search_via_saavn(q)
+    results = []
     
-    # Trigger YouTube fallback if JioSaavn returned no results
-    if not results:
-        print("JioSaavn search returned zero results. Falling back to YouTube...")
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'quiet': True,
-            'logger': MyLogger(),
-            'extract_flat': 'in_playlist',
-        }
-        
-        search_success = False
-        
-        # Attempt search via yt-dlp first
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                search_query = f"ytsearch10:{q}"
-                info = ydl.extract_info(search_query, download=False)
-                
-                if info and 'entries' in info:
-                    for entry in info['entries']:
-                        if not entry:
-                            continue
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'logger': MyLogger(),
+        'extract_flat': 'in_playlist',
+    }
+    
+    search_success = False
+    
+    # Attempt YouTube search via yt-dlp first
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            search_query = f"ytsearch10:{q}"
+            info = ydl.extract_info(search_query, download=False)
+            
+            if info and 'entries' in info:
+                for entry in info['entries']:
+                    if not entry:
+                        continue
+                    
+                    video_id = entry.get('id')
+                    if not video_id:
+                        continue
                         
-                        video_id = entry.get('id')
-                        if not video_id:
-                            continue
-                            
-                        duration = entry.get('duration')
-                        duration_str = ""
-                        if duration:
-                            minutes = int(duration // 60)
-                            seconds = int(duration % 60)
-                            duration_str = f"{minutes}:{seconds:02d}"
-                        else:
-                            duration_str = "Unknown"
-                            
-                        results.append({
-                            'id': video_id,
-                            'source': 'youtube',
-                            'title': entry.get('title', 'Unknown Title'),
-                            'duration': duration_str,
-                            'duration_seconds': duration,
-                            'uploader': entry.get('uploader') or entry.get('channel', 'Unknown Artist'),
-                            'views': f"{entry.get('view_count', 0):,}" if entry.get('view_count') else "0",
-                            'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                            'url': f"https://www.youtube.com/watch?v={video_id}",
-                            'stream_url': ''
-                        })
-                    search_success = True
-            except Exception as e:
-                print(f"Direct yt-dlp search failed: {e}. Trying Invidious search fallback...")
-                
-        # Trigger Invidious search fallback if yt-dlp failed
-        if not search_success or not results:
-            raw_invidious = search_via_invidious(q)
-            if raw_invidious:
-                for r in raw_invidious:
-                    r['source'] = 'youtube'
-                    r['stream_url'] = ''
-                    results.append(r)
-                print("Search successfully completed via Invidious search fallback.")
-                
+                    duration = entry.get('duration')
+                    duration_str = ""
+                    if duration:
+                        minutes = int(duration // 60)
+                        seconds = int(duration % 60)
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                        
+                    results.append({
+                        'id': video_id,
+                        'source': 'youtube',
+                        'title': entry.get('title', 'Unknown Title'),
+                        'duration': duration_str,
+                        'duration_seconds': duration,
+                        'uploader': entry.get('uploader') or entry.get('channel', 'Unknown Artist'),
+                        'views': f"{entry.get('view_count', 0):,}" if entry.get('view_count') else "0",
+                        'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                        'url': f"https://www.youtube.com/watch?v={video_id}",
+                        'stream_url': ''
+                    })
+                search_success = True
+        except Exception as e:
+            print(f"Direct yt-dlp YouTube search failed: {e}. Trying Invidious search fallback...")
+            
+    # Trigger Invidious search fallback if yt-dlp failed or returned nothing
+    if not search_success or not results:
+        raw_invidious = search_via_invidious(q)
+        if raw_invidious:
+            for r in raw_invidious:
+                r['source'] = 'youtube'
+                r['stream_url'] = ''
+                results.append(r)
+            print("Search successfully completed via Invidious search fallback.")
+            
+    # Append JioSaavn results at the end
+    try:
+        saavn_results = search_via_saavn(q)
+        if saavn_results:
+            results.extend(saavn_results)
+    except Exception as saavn_err:
+        print(f"JioSaavn search failed during merge: {saavn_err}")
+        
     if not results:
         return {"results": []}
         
@@ -381,7 +395,7 @@ def search_songs(q: str = Query(..., min_length=1)):
 
 @app.get("/api/download")
 def download_song(id: str = Query(..., min_length=1), source: str = Query("youtube"), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Downloads the audio file onto the server, and returns it as a direct download attachment."""
+    """Downloads the audio file onto the server, converts it to a 320kbps MP3, and returns it."""
     if source == "saavn":
         stream_url = None
         title = "song"
@@ -417,16 +431,35 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
         if not stream_url:
             raise HTTPException(status_code=404, detail="JioSaavn download URL could not be resolved.")
             
-        file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+        temp_file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+        file_path = os.path.join(DOWNLOADS_DIR, f"{id}.mp3")
         download_success = False
         try:
             r = requests.get(stream_url, stream=True, timeout=60)
             if r.status_code == 200:
-                with open(file_path, 'wb') as f:
+                with open(temp_file_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
-                download_success = True
+                
+                # Convert the JioSaavn file to MP3
+                import subprocess
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", temp_file_path, 
+                        "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", 
+                        file_path
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    download_success = True
+                except Exception as conv_err:
+                    print(f"JioSaavn MP3 conversion failed: {conv_err}. Serving original file.")
+                    file_path = temp_file_path
+                    ext = "mp4"
+                    download_success = True
+                finally:
+                    if os.path.exists(temp_file_path) and temp_file_path != file_path:
+                        try: os.remove(temp_file_path)
+                        except: pass
         except Exception as err:
             print(f"Saavn file download failed: {err}")
             
@@ -461,15 +494,20 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
         'outtmpl': os.path.join(DOWNLOADS_DIR, '%(id)s.%(ext)s'),
         'quiet': True,
         'logger': MyLogger(),
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '320',
+        }],
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android_music', 'web_embedded']
+                'player_client': ['android']
             }
         }
     }
     
     file_path = None
-    ext = 'm4a'
+    ext = 'mp3'
     title = 'song'
     download_success = False
     
@@ -477,8 +515,7 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=True)
-            ext = info.get('ext', 'm4a')
-            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.mp3")
             title = info.get('title', 'song')
             if os.path.exists(file_path):
                 download_success = True
@@ -490,18 +527,37 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
         invidious_data = get_invidious_audio_stream(id)
         if invidious_data:
             stream_url = invidious_data["url"]
-            ext = invidious_data["ext"]
+            temp_ext = invidious_data["ext"]
             title = invidious_data["title"]
-            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{ext}")
+            temp_file_path = os.path.join(DOWNLOADS_DIR, f"{id}.{temp_ext}")
+            file_path = os.path.join(DOWNLOADS_DIR, f"{id}.mp3")
             
             try:
                 r = requests.get(stream_url, stream=True, timeout=60)
                 if r.status_code == 200:
-                    with open(file_path, 'wb') as f:
+                    with open(temp_file_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 f.write(chunk)
-                    download_success = True
+                                
+                    # Convert the Invidious download to MP3
+                    import subprocess
+                    try:
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", temp_file_path, 
+                            "-vn", "-ar", "44100", "-ac", "2", "-b:a", "320k", 
+                            file_path
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                        download_success = True
+                    except Exception as conv_err:
+                        print(f"Invidious download conversion failed: {conv_err}. Serving original file.")
+                        file_path = temp_file_path
+                        ext = temp_ext
+                        download_success = True
+                    finally:
+                        if os.path.exists(temp_file_path) and temp_file_path != file_path:
+                            try: os.remove(temp_file_path)
+                            except: pass
             except Exception as inv_err:
                 print(f"Invidious file download failed: {inv_err}")
                 
@@ -531,7 +587,7 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
     return FileResponse(
         path=file_path,
         filename=filename,
-        media_type='application/octet-stream',
+        media_type='audio/mpeg' if ext == 'mp3' else 'application/octet-stream',
         background=background_tasks
     )
 
