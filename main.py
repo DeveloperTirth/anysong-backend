@@ -381,7 +381,9 @@ def search_songs(q: str = Query(..., min_length=1)):
 
 @app.get("/api/stream")
 def stream_song(id: str = Query(..., min_length=1), source: str = Query("youtube")):
-    """Proxies the audio stream from YouTube/Invidious or redirects for JioSaavn with stream URL caching."""
+    """Proxies the audio stream from YouTube/Invidious or JioSaavn with stream URL caching."""
+    mime_type = "audio/mp4"
+    
     if source == "saavn":
         cached_data = stream_cache.get(id)
         if cached_data:
@@ -413,54 +415,53 @@ def stream_song(id: str = Query(..., min_length=1), source: str = Query("youtube
         if not stream_url:
             raise HTTPException(status_code=404, detail="JioSaavn stream URL could not be resolved.")
             
-        return RedirectResponse(url=stream_url)
-
-    # Check cache first for YouTube
-    cached_data = stream_cache.get(id)
-    if cached_data:
-        stream_url = cached_data["url"]
-        mime_type = cached_data["mime_type"]
     else:
-        stream_url = None
-        mime_type = None
-        
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'logger': MyLogger(),
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['ios', 'android_music', 'web_embedded']
+        # Check cache first for YouTube
+        cached_data = stream_cache.get(id)
+        if cached_data:
+            stream_url = cached_data["url"]
+            mime_type = cached_data["mime_type"]
+        else:
+            stream_url = None
+            mime_type = None
+            
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'logger': MyLogger(),
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['ios', 'android_music', 'web_embedded']
+                    }
                 }
             }
-        }
-        
-        # Try resolving via yt-dlp
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
-                stream_url = info.get('url')
-                mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
-            except Exception as yt_err:
-                print(f"yt-dlp stream extraction failed: {yt_err}. Trying Invidious fallback...")
-                
-        # Try resolving via Invidious
-        if not stream_url:
-            invidious_data = get_invidious_audio_stream(id)
-            if invidious_data:
-                stream_url = invidious_data["url"]
-                ext = invidious_data["ext"]
-                mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
-                
-        # If resolved successfully, store in cache (1 hour TTL)
-        if stream_url and mime_type:
-            stream_cache.set(id, {"url": stream_url, "mime_type": mime_type}, ttl=3600)
             
-    if not stream_url:
-        raise HTTPException(
-            status_code=404, 
-            detail="Audio stream not found. YouTube bot block active and all Invidious fallbacks exhausted."
-        )
+            # Try resolving via yt-dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
+                    stream_url = info.get('url')
+                    mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
+                except Exception as yt_err:
+                    print(f"yt-dlp stream extraction failed: {yt_err}. Trying Invidious fallback...")
+                    
+            # Try resolving via Invidious
+            if not stream_url:
+                invidious_data = get_invidious_audio_stream(id)
+                if invidious_data:
+                    stream_url = invidious_data["url"]
+                    ext = invidious_data["ext"]
+                    mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
+                    
+            # If resolved successfully, store in cache (1 hour TTL)
+            if stream_url and mime_type:
+                stream_cache.set(id, {"url": stream_url, "mime_type": mime_type}, ttl=3600)
+                
+        if not stream_url:
+            raise HTTPException(
+                status_code=404, 
+                detail="Audio stream not found. YouTube bot block active and all Invidious fallbacks exhausted."
+            )
         
     try:
         r = requests.get(stream_url, stream=True, timeout=15)
