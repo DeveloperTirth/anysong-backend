@@ -172,8 +172,8 @@ class InMemoryTTLCache:
 # Instantiate caches
 # Search Cache: 30 minutes TTL
 search_cache = InMemoryTTLCache()
-# Stream URL Cache: 1 hour TTL
-stream_cache = InMemoryTTLCache()
+# Resolved URL Cache: 1 hour TTL
+url_cache = InMemoryTTLCache()
 
 def fetch_active_invidious_instances() -> list:
     """Dynamically retrieves active public Invidious instances to ensure maximum uptime."""
@@ -379,115 +379,6 @@ def search_songs(q: str = Query(..., min_length=1)):
     
     return {"results": results, "cached": False}
 
-@app.get("/api/stream")
-def stream_song(id: str = Query(..., min_length=1), source: str = Query("youtube")):
-    """Proxies the audio stream from YouTube/Invidious or JioSaavn with stream URL caching."""
-    mime_type = "audio/mp4"
-    
-    if source == "saavn":
-        cached_data = stream_cache.get(id)
-        if cached_data:
-            stream_url = cached_data["url"]
-        else:
-            stream_url = None
-            try:
-                search_url = "https://www.jiosaavn.com/api.php"
-                params_details = {
-                    "__call": "song.getDetails",
-                    "_format": "json",
-                    "pids": id
-                }
-                r_details = requests.get(search_url, params=params_details, timeout=6)
-                if r_details.status_code == 200:
-                    details_data = r_details.json()
-                    song_details = details_data.get(id)
-                    if song_details:
-                        encrypted_url = song_details.get("encrypted_media_url")
-                        if encrypted_url:
-                            decrypted = decrypt_saavn_url(encrypted_url)
-                            if decrypted:
-                                has_320 = str(song_details.get("320kbps")).lower() == "true"
-                                stream_url = decrypted.replace("_96.mp4", "_320.mp4") if has_320 else decrypted.replace("_96.mp4", "_160.mp4")
-                                stream_cache.set(id, {"url": stream_url, "mime_type": "audio/mp4"}, ttl=3600)
-            except Exception as e:
-                print(f"JioSaavn stream details fetch failed: {e}")
-                
-        if not stream_url:
-            raise HTTPException(status_code=404, detail="JioSaavn stream URL could not be resolved.")
-            
-    else:
-        # Check cache first for YouTube
-        cached_data = stream_cache.get(id)
-        if cached_data:
-            stream_url = cached_data["url"]
-            mime_type = cached_data["mime_type"]
-        else:
-            stream_url = None
-            mime_type = None
-            
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'quiet': True,
-                'logger': MyLogger(),
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['ios', 'android_music', 'web_embedded']
-                    }
-                }
-            }
-            
-            # Try resolving via yt-dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={id}", download=False)
-                    stream_url = info.get('url')
-                    mime_type = 'audio/mp4' if info.get('ext') == 'm4a' else 'audio/webm'
-                except Exception as yt_err:
-                    print(f"yt-dlp stream extraction failed: {yt_err}. Trying Invidious fallback...")
-                    
-            # Try resolving via Invidious
-            if not stream_url:
-                invidious_data = get_invidious_audio_stream(id)
-                if invidious_data:
-                    stream_url = invidious_data["url"]
-                    ext = invidious_data["ext"]
-                    mime_type = 'audio/webm' if ext == 'webm' else 'audio/mp4'
-                    
-            # If resolved successfully, store in cache (1 hour TTL)
-            if stream_url and mime_type:
-                stream_cache.set(id, {"url": stream_url, "mime_type": mime_type}, ttl=3600)
-                
-        if not stream_url:
-            raise HTTPException(
-                status_code=404, 
-                detail="Audio stream not found. YouTube bot block active and all Invidious fallbacks exhausted."
-            )
-        
-    try:
-        r = requests.get(stream_url, stream=True, timeout=15)
-        
-        response_headers = {}
-        headers_to_forward = ['Content-Type', 'Content-Length', 'Accept-Ranges']
-        for h in headers_to_forward:
-            if h in r.headers:
-                response_headers[h] = r.headers[h]
-                
-        if 'Content-Type' not in response_headers and mime_type:
-            response_headers['Content-Type'] = mime_type
-            
-        def iter_content():
-            try:
-                for chunk in r.iter_content(chunk_size=65536):
-                    yield chunk
-            except Exception as stream_err:
-                print(f"Streaming proxy interrupted: {stream_err}")
-            finally:
-                r.close()
-                
-        return StreamingResponse(iter_content(), headers=response_headers)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Streaming failed: {str(e)}")
-
 @app.get("/api/download")
 def download_song(id: str = Query(..., min_length=1), source: str = Query("youtube"), background_tasks: BackgroundTasks = BackgroundTasks()):
     """Downloads the audio file onto the server, and returns it as a direct download attachment."""
@@ -496,9 +387,9 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
         title = "song"
         ext = "mp4"
         
-        cached_data = stream_cache.get(id)
+        cached_data = url_cache.get(id)
         if cached_data:
-            stream_url = cached_data["url"]
+            stream_url = cached_data
             
         try:
             search_url = "https://www.jiosaavn.com/api.php"
@@ -519,6 +410,7 @@ def download_song(id: str = Query(..., min_length=1), source: str = Query("youtu
                         if decrypted:
                             has_320 = str(song_details.get("320kbps")).lower() == "true"
                             stream_url = decrypted.replace("_96.mp4", "_320.mp4") if has_320 else decrypted.replace("_96.mp4", "_160.mp4")
+                            url_cache.set(id, stream_url, ttl=3600)
         except Exception as e:
             print(f"JioSaavn download details fetch failed: {e}")
             
